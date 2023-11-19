@@ -104,7 +104,7 @@ class RunContext:
         env: "EnvVarsManager",
         working_dir: Path,
         executor_config: Optional[Mapping[str, str]] = None,
-        capture_stdout: bool = False,
+        capture_stdout: Union[str, bool] = False,
     ) -> "PoeExecutor":
         from .executor import PoeExecutor
 

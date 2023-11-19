@@ -6,6 +6,7 @@ from typing import (
     Any,
     Collection,
     Dict,
+    Generic,
     Iterator,
     List,
     NamedTuple,
@@ -13,10 +14,12 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    TypeVar,
     Union,
 )
 
 from ..exceptions import PoeException
+from ..options import PoeOptions
 
 if TYPE_CHECKING:
     from ..config import PoeConfig
@@ -24,8 +27,6 @@ if TYPE_CHECKING:
     from ..env.manager import EnvVarsManager
     from ..ui import PoeUi
 
-
-TaskDef = Union[str, Dict[str, Any], List[Union[str, Dict[str, Any]]]]
 
 _TASK_NAME_PATTERN = re.compile(r"^\w[\w\d\-\_\+\:]*$")
 
@@ -41,11 +42,16 @@ class MetaPoeTask(type):
         if cls.__name__ == "PoeTask":
             return
         assert isinstance(getattr(cls, "__key__", None), str)
-        assert isinstance(getattr(cls, "__options__", None), dict)
+        assert issubclass(getattr(cls, "TaskOptions", None), PoeOptions)
         PoeTask._PoeTask__task_types[cls.__key__] = cls
 
 
 TaskContent = Union[str, List[Union[str, Dict[str, Any]]]]
+
+TaskDef = Union[str, Dict[str, Any], List[Union[str, Dict[str, Any]]]]
+
+
+O = TypeVar("O", bound="PoeTask.TaskOptions")
 
 
 class TaskInheritance(NamedTuple):
@@ -57,54 +63,70 @@ class TaskInheritance(NamedTuple):
 
     @classmethod
     def from_task(cls, parent_task: "PoeTask"):
-        return cls(cwd=str(parent_task.options.get("cwd", parent_task.inheritance.cwd)))
+        return cls(
+            cwd=str(parent_task.spec.options.get("cwd", parent_task.inheritance.cwd))
+        )
 
 
 class PoeTask(metaclass=MetaPoeTask):
-    name: str
-    content: TaskContent
-    options: Dict[str, Any]
+    __key__: str
+    __content_type__: Type = str
+
+    class TaskOptions(PoeOptions):
+        args: Union[dict, list]
+        capture_stdout: str = ""
+        cwd: str = ""
+        deps: Sequence
+        env: dict
+        envfile: Union[str, list]
+        executor: dict
+        help: str = ""
+        uses: dict
+
+    class TaskSpec(Generic[O]):
+        name: str
+        content: TaskContent
+        options: O
+        task_type: Type["PoeTask"]
+
+        def __init__(
+            self,
+            name: str,
+            task_def: TaskDef,
+            task_type: Type["PoeTask"],
+            config: "PoeConfig",
+        ):
+            self.name = name
+            self.content = task_def[task_type.__key__]
+            self.options = task_type.TaskOptions(task_def)
+            self.task_type = task_type
+
+    spec: TaskSpec
     inheritance: TaskInheritance
     named_args: Optional[Dict[str, str]] = None
 
-    __options__: Dict[str, Union[Type, Tuple[Type, ...]]] = {}
-    __content_type__: Type = str
-    __base_options: Dict[str, Union[Type, Tuple[Type, ...]]] = {
-        "args": (dict, list),
-        "capture_stdout": str,
-        "cwd": str,
-        "deps": list,
-        "env": dict,
-        "envfile": (str, list),
-        "executor": dict,
-        "help": str,
-        "uses": dict,
-    }
     __task_types: Dict[str, Type["PoeTask"]] = {}
-
     __upstream_invocations: Optional[
         Dict[str, Union[List[Tuple[str, ...]], Dict[str, Tuple[str, ...]]]]
     ] = None
 
     def __init__(
         self,
-        name: str,
-        content: TaskContent,
-        options: Dict[str, Any],
+        spec: TaskSpec,
+        invocation: Tuple[str, ...],
         ui: "PoeUi",
         config: "PoeConfig",
-        invocation: Tuple[str, ...],
         capture_stdout: bool = False,
         inheritance: Optional[TaskInheritance] = None,
     ):
-        self.name = name
-        self.content = content
-        self.options = dict(options, capture_stdout=True) if capture_stdout else options
+        self.spec = spec
+        self.name = spec.name
+        self.invocation = invocation
+        self.inheritance = inheritance or TaskInheritance(cwd=str(config.cwd))
+        self.capture_stdout = capture_stdout or spec.options.capture_stdout
         self._ui = ui
         self._config = config
         self._is_windows = sys.platform == "win32"
-        self.invocation = invocation
-        self.inheritance = inheritance or TaskInheritance(cwd=str(config.project_dir))
 
     @classmethod
     def from_config(
@@ -116,64 +138,67 @@ class PoeTask(metaclass=MetaPoeTask):
         capture_stdout: Optional[bool] = None,
         inheritance: Optional[TaskInheritance] = None,
     ) -> "PoeTask":
-        task_def = config.tasks.get(task_name)
-        if not task_def:
+        if not config.has_task(task_name):
             raise PoeException(f"Cannot instantiate unknown task {task_name!r}")
-        return cls.from_def(
-            task_def,
-            task_name,
-            config,
-            ui,
+        return cls.from_spec(
+            cls.get_task(task_name, config),
             invocation=invocation,
+            config=config,
+            ui=ui,
             capture_stdout=capture_stdout,
             inheritance=inheritance,
         )
 
     @classmethod
-    def from_def(
+    def from_spec(
         cls,
-        task_def: TaskDef,
-        task_name: str,
+        task_spec: TaskSpec,
+        invocation: Tuple[str, ...],
         config: "PoeConfig",
         ui: "PoeUi",
-        invocation: Tuple[str, ...],
         array_item: Union[bool, str] = False,
         capture_stdout: Optional[bool] = None,
         inheritance: Optional[TaskInheritance] = None,
     ) -> "PoeTask":
-        task_type = cls.resolve_task_type(task_def, config, array_item)
-        if task_type is None:
-            # Something is wrong with this task_def
-            raise cls.Error(cls.validate_def(task_name, task_def, config))
-
-        options: Dict[str, Any] = {}
-        if capture_stdout is not None:
-            # Override config because we want to specifically capture the stdout of this
-            # task for internal use
-            options["capture_stdout"] = capture_stdout
-
-        if isinstance(task_def, (str, list)):
-            task_def = cls.normalize_task_def(
-                task_def, config, task_type=cls.__task_types[task_type]
-            )
-
-        assert isinstance(task_def, dict)
-        options = dict(task_def, **options)
-        content = options.pop(task_type)
-        return cls.__task_types[task_type](
-            name=task_name,
-            content=content,
-            options=options,
+        return task_spec.task_type(
+            spec=task_spec,
+            invocation=invocation,
             ui=ui,
             config=config,
-            invocation=invocation,
-            inheritance=inheritance,
+            capture_stdout=capture_stdout,
+            inheritance=inheritance,  # TODO: get from task_spec??
         )
+
+    @classmethod
+    def get_task(cls, name: str, config: "PoeConfig") -> "TaskSpec":
+        # TODO: make this recursive for sequence or switch tasks!!
+        #           => need to delegate to the PoeTask for this???
+        # TODO: cache TaskSpecs
+        #           - or move all of this to a TasksRepository?
+        #           - scope is to create and cache TaskSpecs on demand
+        #           - Task class defines TaskSpec construction logic?
+
+        task_def = config.tasks[name]
+
+        task_type_key = cls.resolve_task_type(task_def, config, array_item=False)
+        assert task_type_key  # TODO: avoid this?
+        task_type = cls.resolve_task_cls(task_type_key)
+
+        if not isinstance(task_def, dict):
+            task_def = {task_type_key: task_def}
+
+        return task_type.get_task_spec(name, task_def, config)
+
+    @classmethod
+    def get_task_spec(
+        cls, name: str, task_def: Dict[str, Any], config
+    ) -> "PoeTask.TaskSpec":
+        return cls.TaskSpec(name=name, task_def=task_def, task_type=cls, config=config)
 
     @classmethod
     def normalize_task_def(
         cls,
-        task_def: TaskDef,
+        task_def: TaskSpec,
         config: "PoeConfig",
         *,
         task_type: Optional[Type["PoeTask"]] = None,
@@ -190,9 +215,14 @@ class PoeTask(metaclass=MetaPoeTask):
         return {getattr(task_type, "__key__", "__key_unknown__"): task_def}
 
     @classmethod
+    def resolve_task_cls(self, key: str):
+        # TODO: avoid this?
+        return self.__task_types[key]
+
+    @classmethod
     def resolve_task_type(
         cls,
-        task_def: TaskDef,
+        task_def: TaskSpec,
         config: "PoeConfig",
         array_item: Union[bool, str] = False,
     ) -> Optional[str]:
@@ -234,7 +264,7 @@ class PoeTask(metaclass=MetaPoeTask):
     def _parse_named_args(
         self, extra_args: Sequence[str], env: "EnvVarsManager"
     ) -> Optional[Dict[str, str]]:
-        if args_def := self.options.get("args"):
+        if args_def := self.spec.options.get("args"):
             from .args import PoeTaskArgs
 
             return PoeTaskArgs(args_def, self.name, self._ui.program_name, env).parse(
@@ -270,8 +300,8 @@ class PoeTask(metaclass=MetaPoeTask):
             extra_args,
             context.get_task_env(
                 parent_env,
-                self.options.get("envfile"),
-                self.options.get("env"),
+                self.spec.options.get("envfile"),
+                self.spec.options.get("env"),
                 upstream_invocations["uses"],
             ),
         )
@@ -297,15 +327,17 @@ class PoeTask(metaclass=MetaPoeTask):
             self.invocation,
             env,
             working_dir=self.get_working_dir(env),
-            executor_config=self.options.get("executor"),
-            capture_stdout=self.options.get("capture_stdout", False),
+            executor_config=self.spec.options.get("executor"),
+            capture_stdout=self.capture_stdout,
         )
 
     def get_working_dir(
         self,
         env: "EnvVarsManager",
     ) -> Path:
-        cwd_option = env.fill_template(self.options.get("cwd", self.inheritance.cwd))
+        cwd_option = env.fill_template(
+            self.spec.options.get("cwd", self.inheritance.cwd)
+        )
         working_dir = Path(cwd_option)
 
         if not working_dir.is_absolute():
@@ -331,20 +363,20 @@ class PoeTask(metaclass=MetaPoeTask):
         """
         import shlex
 
+        options = self.spec.options
+
         if self.__upstream_invocations is None:
-            env = context.get_task_env(
-                None, self.options.get("envfile"), self.options.get("env")
-            )
+            env = context.get_task_env(None, options.get("envfile"), options.get("env"))
             env.update(self.get_named_arg_values(env))
 
             self.__upstream_invocations = {
                 "deps": [
                     tuple(shlex.split(env.fill_template(task_ref)))
-                    for task_ref in self.options.get("deps", tuple())
+                    for task_ref in options.get("deps", tuple())
                 ],
                 "uses": {
                     key: tuple(shlex.split(env.fill_template(task_ref)))
-                    for key, task_ref in self.options.get("uses", {}).items()
+                    for key, task_ref in options.get("uses", {}).items()
                 },
             }
 
@@ -362,13 +394,15 @@ class PoeTask(metaclass=MetaPoeTask):
         )
 
     def has_deps(self) -> bool:
-        return bool(self.options.get("deps", False) or self.options.get("uses", False))
+        return bool(
+            self.spec.options.get("deps", False) or self.spec.options.get("uses", False)
+        )
 
     @classmethod
     def validate_def(
         cls,
         task_name: str,
-        task_def: TaskDef,
+        task_def: TaskSpec,
         config: "PoeConfig",
         *,
         anonymous: bool = False,
@@ -408,9 +442,7 @@ class PoeTask(metaclass=MetaPoeTask):
                 )
 
             for key in set(task_def) - {task_type_key}:
-                expected_type = cls.__base_options.get(
-                    key, task_type.__options__.get(key)
-                )
+                expected_type = task_type.TaskOptions.type_of(key)
                 if expected_type is None:
                     if key not in extra_options:
                         return (
@@ -455,7 +487,7 @@ class PoeTask(metaclass=MetaPoeTask):
                     " options cannot be both provided on the same task."
                 )
 
-            all_task_names = set(config.tasks.keys())
+            all_task_names = set(config.task_names)
 
             if "deps" in task_def:
                 for dep in task_def["deps"]:
@@ -466,7 +498,9 @@ class PoeTask(metaclass=MetaPoeTask):
                             f"reference to unknown task: {dep_task_name!r}"
                         )
 
-                    referenced_task = config.tasks[dep_task_name]
+                    referenced_task = config.tasks[  # TODO: use config.get_task
+                        dep_task_name
+                    ]
                     if isinstance(referenced_task, dict) and referenced_task.get(
                         "use_exec"
                     ):
@@ -493,7 +527,9 @@ class PoeTask(metaclass=MetaPoeTask):
                             f"reference to unknown task: {dep_task_name!r}"
                         )
 
-                    referenced_task = config.tasks[dep_task_name]
+                    referenced_task = config.tasks[  # TODO: use config.get_task
+                        dep_task_name
+                    ]
                     if isinstance(referenced_task, dict):
                         if referenced_task.get("use_exec"):
                             return (
@@ -564,9 +600,7 @@ class PoeTask(metaclass=MetaPoeTask):
         Print the action taken by a task just before executing it.
         """
         min_verbosity = -1 if dry else 0
-        arrow = (
-            "??" if unresolved else "<=" if self.options.get("capture_stdout") else "=>"
-        )
+        arrow = "??" if unresolved else "<=" if self.capture_stdout else "=>"
         self._ui.print_msg(
             f"<hl>Poe {arrow}</hl> <action>{action}</action>", min_verbosity
         )

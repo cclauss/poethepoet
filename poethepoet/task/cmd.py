@@ -1,5 +1,5 @@
 import shlex
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 
 from ..exceptions import PoeException
 from .base import PoeTask
@@ -18,9 +18,9 @@ class CmdTask(PoeTask):
     content: str
 
     __key__ = "cmd"
-    __options__: Dict[str, Union[Type, Tuple[Type, ...]]] = {
-        "use_exec": bool,
-    }
+
+    class TaskOptions(PoeTask.TaskOptions):
+        use_exec: bool
 
     def _handle_run(
         self,
@@ -45,7 +45,7 @@ class CmdTask(PoeTask):
         self._print_action(shlex.join(cmd), context.dry)
 
         return self._get_executor(context, env).execute(
-            cmd, use_exec=self.options.get("use_exec", False)
+            cmd, use_exec=self.spec.options.get("use_exec", False)
         )
 
     def _resolve_args(self, context: "RunContext", env: "EnvVarsManager"):
@@ -53,7 +53,7 @@ class CmdTask(PoeTask):
         from ..helpers.command.ast_core import ParseError
 
         try:
-            command_lines = parse_poe_cmd(self.content).command_lines
+            command_lines = parse_poe_cmd(self.spec.content).command_lines
         except ParseError as error:
             raise PoeException(
                 f"Couldn't parse command line for task {self.name!r}: {error.args[0]}"

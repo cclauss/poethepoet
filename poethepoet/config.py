@@ -6,12 +6,86 @@ try:
 except ImportError:
     import tomli  # type: ignore[no-redef]
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    Union,
+)
 
 from .exceptions import PoeException
+from .options import NoValue, PoeOptions
+
+if TYPE_CHECKING:
+    pass
+
+
+class ConfigPartition:
+    ConfigOptions: Type[PoeOptions]
+    options: PoeOptions
+    full_config: Mapping[str, Any]
+    poe_options: Mapping[str, Any]
+    path: Path
+
+    def __init__(
+        self, full_config: Mapping[str, Any], cwd: Path, path: Optional[Path] = None
+    ):
+        self.poe_options: Mapping[str, Any] = (
+            full_config["tool"]["poe"]
+            if "tool" in full_config
+            else full_config["tool.poe"]
+        )
+        self.options = self.ConfigOptions(self.poe_options)
+        self.full_config = full_config
+        self.path = path
+
+    def get(self, key: str, default: Any = NoValue):
+        return self.options.get(key, default)
+
+    def is_option_type_valid(self, key: str):
+        value = self.options.get(key, None)
+        expected_type = self.options.type_of(key)
+        return isinstance(value, expected_type)
+
+
+class ProjectConfig(ConfigPartition):
+    class ConfigOptions(PoeOptions):
+        """
+        Options allowed directly under tool.poe in pyproject.toml
+        """
+
+        default_task_type: str = "cmd"
+        default_array_task_type: str = "sequence"
+        default_array_item_task_type: str = "ref"
+        env: Mapping[str, str]
+        envfile: Union[str, Sequence[str]]
+        executor: Mapping[str, str]
+        include: Union[str, Sequence[str], Mapping[str, str]]
+        poetry_command: str
+        poetry_hooks: Mapping[str, str]
+        shell_interpreter: Union[str, Sequence[str]] = "posix"
+        verbosity: int = 0
+        tasks: Mapping[str, Any]
+
+
+class IncludedConfig(ConfigPartition):
+    class ConfigOptions(PoeOptions):
+        env: Dict[str, str]
+        envfile: Union[str, List[str]]
+        tasks: Dict[str, Any]
 
 
 class PoeConfig:
+    cwd: Path
+    _project_config: ProjectConfig
+    _included_config: List[IncludedConfig]
+
     KNOWN_SHELL_INTERPRETERS = (
         "posix",
         "sh",
@@ -23,27 +97,14 @@ class PoeConfig:
         "python",
     )
 
+    _config_name: str
     """
-    Options allowed directly under tool.poe in pyproject.toml
+    The parent directory of the project config file
     """
-    __options__ = {
-        "default_task_type": str,
-        "default_array_task_type": str,
-        "default_array_item_task_type": str,
-        "env": dict,
-        "envfile": (str, list),
-        "executor": dict,
-        "include": (str, list, dict),
-        "poetry_command": str,
-        "poetry_hooks": dict,
-        "shell_interpreter": (str, list),
-        "verbosity": int,
-    }
-
+    _project_dir: Optional[Path]
     """
     This can be overridden, for example to align with poetry
     """
-    _baseline_verbosity: int = 0
 
     def __init__(
         self,
@@ -52,88 +113,115 @@ class PoeConfig:
         config_name: str = "pyproject.toml",
     ):
         self.cwd = Path().resolve() if cwd is None else Path(cwd)
-        self._poe = {} if table is None else dict(table)
+        self._project_config = ProjectConfig({"tool.poe": table or {}}, cwd=self.cwd)
+        self._included_config = []
         self._config_name = config_name
-        self._project_dir: Optional[Path] = None
+        self._project_dir = self.cwd
 
     @property
     def executor(self) -> Mapping[str, Any]:
-        return self._poe.get("executor", {"type": "auto"})
+        return self._project_config.get("executor", {"type": "auto"})
 
     @property
-    def tasks(self) -> Mapping[str, Any]:
-        return self._poe.get("tasks", {})
+    def task_names(self) -> Tuple[str]:
+        return tuple(self.tasks.keys())
+
+    @property
+    def tasks(self) -> Mapping[str, Any]:  # TODO: deprecate raw access to tasks!!
+        result = {}
+        for config in reversed(self._included_config):
+            result.update(config.get("tasks"))
+        result.update(self._project_config.get("tasks"))
+        return result
 
     @property
     def default_task_type(self) -> str:
-        return self._poe.get("default_task_type", "cmd")
+        return self._project_config.options.default_task_type
 
     @property
     def default_array_task_type(self) -> str:
-        return self._poe.get("default_array_task_type", "sequence")
+        return self._project_config.options.default_array_task_type
 
     @property
     def default_array_item_task_type(self) -> str:
-        return self._poe.get("default_array_item_task_type", "ref")
+        return self._project_config.options.default_array_item_task_type
 
     @property
     def global_env(self) -> Dict[str, Union[str, Dict[str, str]]]:
-        return self._poe.get("env", {})
+        return self._project_config.get("env")
 
     @property
     def global_envfile(self) -> Optional[str]:
-        return self._poe.get("envfile")
+        return self._project_config.get("envfile", None)
 
     @property
     def shell_interpreter(self) -> Tuple[str, ...]:
-        raw_value = self._poe.get("shell_interpreter", "posix")
+        raw_value = self._project_config.options.shell_interpreter
         if isinstance(raw_value, list):
             return tuple(raw_value)
         return (raw_value,)
 
     @property
     def verbosity(self) -> int:
-        return self._poe.get("verbosity", self._baseline_verbosity)
+        return self._project_config.options.verbosity
 
     @property
-    def project(self) -> Any:
-        return self._project
+    def project(self) -> dict:
+        return self._project_config.full_config
 
     @property
     def project_dir(self) -> str:
         return str(self._project_dir or self.cwd)
 
     def load(self, target_dir: Optional[str] = None):
-        if self._poe:
+        if self._project_config.get("tasks"):
+            if not self._included_config:
+                self._load_includes()
             return
 
         config_path = self.find_config_file(target_dir)
+        self._project_dir = config_path.parent
+
         try:
-            self._project = self._read_config_file(config_path)
-            self._poe = self._project["tool"]["poe"]
+            self._project_config = ProjectConfig(
+                self._read_config_file(config_path),
+                cwd=self._project_dir,
+                path=config_path,
+            )
         except KeyError:
             raise PoeException(
                 f"No poe configuration found in file at {self._config_name}"
             )
-        self._project_dir = config_path.parent
-        self._load_includes(self._project_dir)
+
+        self._load_includes()
+
+    def has_task(self, name: str):
+        return name in self.tasks
 
     def validate(self):
+        # TODO: validate included configs too!!                                    #####
+        self._validate_config()
+
+    def _validate_config(self):
         from .executor import PoeExecutor
         from .task import PoeTask
 
+        supported_options = self._project_config.ConfigOptions.get_fields()
+        raw_poe_config = self._project_config.poe_options
+
         # Validate keys
-        supported_keys = {"tasks", *self.__options__}
-        unsupported_keys = set(self._poe) - supported_keys
+        unsupported_keys = set(raw_poe_config) - set(supported_options)
         if unsupported_keys:
             raise PoeException(f"Unsupported keys in poe config: {unsupported_keys!r}")
 
         # Validate types of option values
-        for key, option_type in self.__options__.items():
-            if key in self._poe and not isinstance(self._poe[key], option_type):
+        for key in supported_options.keys():
+            if key in raw_poe_config and not self._project_config.is_option_type_valid(
+                key
+            ):
                 raise PoeException(
-                    f"Unsupported value for option {key!r}, expected type to be "
-                    f"{option_type.__name__}."
+                    f"Unsupported value for option {key!r}, expected type to match "
+                    f"{option_type!r}."
                 )
 
         # Validate executor config
@@ -231,10 +319,13 @@ class PoeConfig:
             maybe_result = maybe_result.parents[1].joinpath(self._config_name).resolve()
         return maybe_result
 
-    def _load_includes(self, project_dir: Path):
-        include_option: Union[str, Sequence[str]] = self._poe.get("include", tuple())
-        includes: List[Dict[str, str]] = []
+    def _load_includes(self):
+        include_option: Union[str, Sequence[str]] = self._project_config.get(
+            "include", None
+        )
 
+        # Normalize includes configuration
+        includes: List[Dict[str, str]] = []
         if isinstance(include_option, str):
             includes.append({"path": include_option})
         elif isinstance(include_option, dict):
@@ -255,59 +346,98 @@ class PoeConfig:
                         f"Invalid item for the include option {include!r}"
                     )
 
+        # Attempt to load each of the included configs
         for include in includes:
-            include_path = project_dir.joinpath(include["path"]).resolve()
+            include_path = self._project_dir.joinpath(include["path"]).resolve()
 
             if not include_path.exists():
                 # TODO: print warning in verbose mode, requires access to ui somehow
                 continue
 
             try:
-                include_config = PoeConfig(
-                    cwd=include.get("cwd", self.project_dir),
-                    table=self._read_config_file(include_path)["tool"]["poe"],
+                self._included_config.append(
+                    IncludedConfig(
+                        self._read_config_file(include_path),
+                        cwd=include.get("cwd", self.project_dir),
+                        path=include_path,
+                    )
                 )
-                include_config._project_dir = self._project_dir
+                # include_config = PoeConfig(
+                #     cwd=include.get("cwd", self.project_dir),
+                #     table=self._read_config_file(include_path)["tool"]["poe"],
+                # )
+                # include_config._project_dir = self._project_dir
             except (PoeException, KeyError) as error:
                 raise PoeException(
                     f"Invalid content in included file from {include_path}", error
                 ) from error
 
-            self._merge_config(include_config)
+    # def _merge_config(self, include_config: "PoeConfig"):  # TODO: DELETE THIS
+    #     from .task import PoeTask
 
-    def _merge_config(self, include_config: "PoeConfig"):
-        from .task import PoeTask
+    #     ## PROBLEMS ##
+    #     # - should include.cwd dictate how we look for envfile??
+    #     #   - YES: so we can use the .env from the target project area
+    #     #   - NO: because we're working in the root project
+    #     #   - OR: envfile should only apply to included tasks??  ...  ??
+    #     #       - breaking change... but makes sense?
+    #     #       - configurable within included file: global.env global.envfile   <---=
+    #     #   - COMPS:
+    #     #       - included envfile has can be overridden by envfile from root
+    #     #            (explain rationale in docs)
+    #     #       - yes only if "cwd=True" in included file (this sounds dumb)
+    #     #   - ??
+    #     #       - do we also need an option to isolate included tasks from root env??
+    #     #           - naaa
+    #     # - include.cwd how to keep track of task connection to included config file?
+    #     #       - so task can prefer the env from the included config...
 
-        # Env is special because it can be extended rather than just overwritten
-        if include_config.global_env:
-            self._poe["env"] = {**include_config.global_env, **self._poe.get("env", {})}
+    #     """
+    #     include.cwd should apply to
+    #     - imported tasks
+    #     - file level envfiles
+    #     - task
+    #         - level envfiles
+    #         - capture_stdout
 
-        if include_config.global_envfile and "envfile" not in self._poe:
-            self._poe["envfile"] = include_config.global_envfile
+    #     task_def, task_inheritance = config.get_task(task_name)
 
-        # Includes additional tasks with preserved ordering
-        self._poe["tasks"] = own_tasks = self._poe.get("tasks", {})
-        for task_name, task_def in include_config.tasks.items():
-            if task_name in own_tasks:
-                # don't override tasks from the base config
-                continue
+    #     """
 
-            task_def = PoeTask.normalize_task_def(task_def, include_config)
-            if include_config.cwd:
-                # Override the config of each task to use the include level cwd as a
-                # base for the task level cwd
-                if "cwd" in task_def:
-                    # rebase the configured cwd onto the include level cwd
-                    task_def["cwd"] = str(
-                        Path(include_config.cwd)
-                        .resolve()
-                        .joinpath(task_def["cwd"])
-                        .relative_to(self.project_dir)
-                    )
-                else:
-                    task_def["cwd"] = str(include_config.cwd)
+    #     # Env is special because it can be extended rather than just overwritten
+    #     if include_config.global_env:
+    #         self._poe["env"] = {**include_config.global_env, **self._poe.get("env", {})}
 
-            own_tasks[task_name] = task_def
+    #     if include_config.global_envfile and "envfile" not in self._poe:
+    #         self._poe[
+    #             "envfile"
+    #         ] = (  ## FIXME: if envfile in root config then included envfile ignored??
+    #             include_config.global_envfile
+    #         )
+
+    #     # Includes additional tasks with preserved ordering
+    #     self._poe["tasks"] = own_tasks = self._poe.get("tasks", {})
+    #     for task_name, task_def in include_config.tasks.items():
+    #         if task_name in own_tasks:
+    #             # don't override tasks from the base config
+    #             continue
+
+    #         task_def = PoeTask.normalize_task_def(task_def, include_config)
+    #         if include_config.cwd:
+    #             # Override the config of each task to use the include level cwd as a
+    #             # base for the task level cwd
+    #             if "cwd" in task_def:
+    #                 # rebase the configured cwd onto the include level cwd
+    #                 task_def["cwd"] = str(
+    #                     Path(include_config.cwd)
+    #                     .resolve()
+    #                     .joinpath(task_def["cwd"])
+    #                     .relative_to(self.project_dir)
+    #                 )
+    #             else:
+    #                 task_def["cwd"] = str(include_config.cwd)
+
+    #         own_tasks[task_name] = task_def
 
     @staticmethod
     def _read_config_file(path: Path) -> Mapping[str, Any]:

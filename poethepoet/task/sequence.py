@@ -11,7 +11,7 @@ from typing import (
 )
 
 from ..exceptions import ExecutionError, PoeException
-from .base import PoeTask, TaskContent, TaskInheritance
+from .base import PoeTask, TaskDef, TaskInheritance
 
 if TYPE_CHECKING:
     from ..config import PoeConfig
@@ -29,42 +29,88 @@ class SequenceTask(PoeTask):
 
     __key__ = "sequence"
     __content_type__: Type = list
-    __options__: Dict[str, Union[Type, Tuple[Type, ...]]] = {
-        "ignore_fail": (bool, str),
-        "default_item_type": str,
-    }
+
+    class TaskOptions(PoeTask.TaskOptions):
+        ignore_fail: Union[bool, str]
+        default_item_type: str
+
+    class TaskSpec(PoeTask.TaskSpec[TaskOptions]):
+        subtasks: Sequence[PoeTask.TaskSpec]
+
+        def __init__(
+            self,
+            name: str,
+            task_def: TaskDef,
+            task_type: Type["PoeTask"],
+            config: "PoeConfig",
+        ):
+            super().__init__(name, task_def, task_type, config)
+
+            self.subtasks = []
+            for index, sub_task_def in enumerate(task_def[task_type.__key__]):
+                # TODO: avoid repeating this logic to get subtask_type here?
+                task_type_key = task_type.resolve_task_type(
+                    sub_task_def, config, array_item=True
+                )
+                subtask_type = task_type.resolve_task_cls(task_type_key)
+                if not isinstance(sub_task_def, dict):
+                    sub_task_def = {task_type_key: sub_task_def}
+
+                self.subtasks.append(
+                    subtask_type.get_task_spec(
+                        SequenceTask._subtask_name(name, index), sub_task_def, config
+                    )
+                )
 
     def __init__(
         self,
-        name: str,
-        content: TaskContent,
-        options: Dict[str, Any],
+        spec: TaskSpec,
+        invocation: Tuple[str, ...],
         ui: "PoeUi",
         config: "PoeConfig",
-        invocation: Tuple[str, ...],
         capture_stdout: bool = False,
         inheritance: Optional[TaskInheritance] = None,
     ):
-        assert capture_stdout is False
-        super().__init__(
-            name, content, options, ui, config, invocation, False, inheritance
-        )
+        assert capture_stdout in (False, None)  # TODO: tidy this?
+        super().__init__(spec, invocation, ui, config, False, inheritance)
 
         self.subtasks = [
-            self.from_def(
-                task_def=item,
-                task_name=task_name,
+            self.from_spec(
+                task_spec=task_spec,
+                invocation=(task_spec.name,),
                 config=config,
-                invocation=(task_name,),
                 ui=ui,
-                array_item=self.options.get("default_item_type", True),
+                array_item=self.spec.options.get("default_item_type", True),
                 inheritance=TaskInheritance.from_task(self),
             )
-            for index, item in enumerate(self.content)
-            for task_name in (
-                item if isinstance(item, str) else self._subtask_name(name, index),
-            )
+            for task_spec in spec.subtasks
         ]
+
+    # @classmethod
+    # def get_task_spec(
+    #     cls, name: str, task_def: Dict[str, Any], config: "PoeConfig"
+    # ) -> TaskSpec:
+    #     subtasks = []
+    #     for index, sub_task_def in enumerate(task_def[cls.__key__]):
+    #         # TODO: avoid repeating this logic here
+    #         task_type_key = cls.resolve_task_type(sub_task_def, config, array_item=True)
+    #         task_type = cls.resolve_task_cls(task_type_key)
+    #         if not isinstance(sub_task_def, dict):
+    #             sub_task_def = {task_type_key: sub_task_def}
+
+    #         subtasks.append(
+    #             task_type.get_task_spec(
+    #                 self._subtask_name(name, index), sub_task_def, config
+    #             )
+    #         )
+
+    #     return TaskSpec(
+    #         name=name,
+    #         content=None,
+    #         options=cls.TaskOptions(task_def),
+    #         task_type=cls,
+    #         subtasks=subtasks,
+    #     )
 
     def _handle_run(
         self,
@@ -82,7 +128,7 @@ class SequenceTask(PoeTask):
             # Indicate on the global context that there are multiple stages
             context.multistage = True
 
-        ignore_fail = self.options.get("ignore_fail")
+        ignore_fail = self.spec.options.get("ignore_fail")
         non_zero_subtasks: List[str] = list()
         for subtask in self.subtasks:
             task_result = subtask.run(

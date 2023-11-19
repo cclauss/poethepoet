@@ -8,7 +8,6 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    Type,
     Union,
 )
 
@@ -29,11 +28,11 @@ class ExprTask(PoeTask):
     content: str
 
     __key__ = "expr"
-    __options__: Dict[str, Union[Type, Tuple[Type, ...]]] = {
-        "imports": list,
-        "assert": (bool, int),
-        "use_exec": bool,
-    }
+
+    class TaskOptions(PoeTask.TaskOptions):
+        imports: list
+        assert_: Union[bool, int]
+        use_exec: bool
 
     def _handle_run(
         self,
@@ -46,7 +45,7 @@ class ExprTask(PoeTask):
         named_arg_values = self.get_named_arg_values(env)
         env.update(named_arg_values)
 
-        imports = self.options.get("imports", tuple())
+        imports = self.spec.options.get("imports", tuple())
 
         expr, env_values = self.parse_content(named_arg_values, env, imports)
         argv = [
@@ -63,7 +62,7 @@ class ExprTask(PoeTask):
             "print(result);",
         ]
 
-        falsy_return_code = int(self.options.get("assert", False))
+        falsy_return_code = int(self.spec.options.get("assert", False))
         if falsy_return_code:
             script.append(f"exit(0 if result else {falsy_return_code});")
 
@@ -74,7 +73,7 @@ class ExprTask(PoeTask):
 
         self._print_action(self.content.strip(), context.dry)
         return self._get_executor(context, env).execute(
-            cmd, use_exec=self.options.get("use_exec", False)
+            cmd, use_exec=self.spec.options.get("use_exec", False)
         )
 
     @classmethod

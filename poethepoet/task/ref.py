@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence
 
 from .base import PoeTask, TaskInheritance
 
@@ -16,7 +16,9 @@ class RefTask(PoeTask):
     content: str
 
     __key__ = "ref"
-    __options__: Dict[str, Union[Type, Tuple[Type, ...]]] = {}
+
+    class TaskOptions(PoeTask.TaskOptions):
+        pass
 
     def _handle_run(
         self,
@@ -29,7 +31,7 @@ class RefTask(PoeTask):
         """
         import shlex
 
-        invocation = tuple(shlex.split(env.fill_template(self.content.strip())))
+        invocation = tuple(shlex.split(env.fill_template(self.spec.content.strip())))
         extra_args = [*invocation[1:], *extra_args]
         task = self.from_config(
             invocation[0],
@@ -89,13 +91,13 @@ class RefTask(PoeTask):
         task_ref = task_def["ref"]
         task_name_ref = shlex.split(task_ref)[0]
 
-        if task_name_ref not in config.tasks:
+        if task_name_ref not in config.task_names:
             return (
                 f"Task {task_name!r} contains reference to unknown task "
                 f"{task_name_ref!r}"
             )
 
-        referenced_task = config.tasks[task_name_ref]
+        referenced_task = config.tasks[task_name_ref]  # TODO: use config.get_task
         if isinstance(referenced_task, dict) and referenced_task.get("use_exec"):
             return (
                 f"Invalid task: {task_name!r}. contains illegal reference to task with "

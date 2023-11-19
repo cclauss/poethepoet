@@ -180,7 +180,7 @@ class PoeExecutor(metaclass=MetaPoeExecutor):
                 return self._handle_file_not_found(cmd, error)
             if error.filename == self.working_dir:
                 raise PoeException(
-                    "The specified working directory does not exists "
+                    "The specified working directory does not exist "
                     f"'{self.working_dir}'"
                 )
             raise

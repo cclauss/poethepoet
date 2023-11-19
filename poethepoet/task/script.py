@@ -1,6 +1,6 @@
 import re
 import shlex
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
 
 from ..exceptions import ExpressionParseError
 from .base import PoeTask
@@ -19,10 +19,10 @@ class ScriptTask(PoeTask):
     content: str
 
     __key__ = "script"
-    __options__: Dict[str, Union[Type, Tuple[Type, ...]]] = {
-        "use_exec": bool,
-        "print_result": bool,
-    }
+
+    class TaskOptions(PoeTask.TaskOptions):
+        use_exec: bool
+        print_result: bool
 
     def _handle_run(
         self,
@@ -58,7 +58,7 @@ class ScriptTask(PoeTask):
             f" else _m.{function_call};",
         ]
 
-        if self.options.get("print_result"):
+        if self.spec.options.get("print_result"):
             script.append("_r is not None and print(_r);")
 
         # Exactly which python executable to use is usually resolved by the executor
@@ -68,7 +68,7 @@ class ScriptTask(PoeTask):
 
         self._print_action(shlex.join(argv), context.dry)
         return self._get_executor(context, env).execute(
-            cmd, use_exec=self.options.get("use_exec", False)
+            cmd, use_exec=self.spec.options.get("use_exec", False)
         )
 
     @classmethod
@@ -101,10 +101,10 @@ class ScriptTask(PoeTask):
         from ..helpers.python import resolve_expression
 
         try:
-            target_module, target_ref = self.content.strip().split(":", 1)
+            target_module, target_ref = self.spec.content.strip().split(":", 1)
         except ValueError:
             raise ExpressionParseError(
-                f"Invalid task content: {self.content.strip()!r}"
+                f"Invalid task content: {self.spec.content.strip()!r}"
             )
 
         if target_ref.isidentifier():

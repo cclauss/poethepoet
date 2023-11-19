@@ -8,7 +8,6 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    Type,
     Union,
 )
 
@@ -29,7 +28,9 @@ class ShellTask(PoeTask):
     content: str
 
     __key__ = "shell"
-    __options__: Dict[str, Union[Type, Tuple[Type, ...]]] = {"interpreter": (str, list)}
+
+    class TaskOptions(PoeTask.TaskOptions):
+        interpreter: Union[str, list]
 
     def _handle_run(
         self,
@@ -65,7 +66,7 @@ class ShellTask(PoeTask):
         )
 
     def _get_interpreter_config(self) -> Tuple[str, ...]:
-        result: Union[str, Tuple[str, ...]] = self.options.get(
+        result: Union[str, Tuple[str, ...]] = self.spec.options.get(
             "interpreter", self._config.shell_interpreter
         )
         if isinstance(result, str):

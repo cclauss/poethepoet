@@ -131,7 +131,7 @@ class PoeThePoet:
             return None
 
         task_name = task[0]
-        if task_name not in self.config.tasks:
+        if task_name not in self.config.task_names:
             self.print_help(error=PoeException(f"Unrecognised task {task_name!r}"))
             return None
 

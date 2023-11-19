@@ -49,7 +49,7 @@ def _list_tasks():
 
         config = PoeConfig()
         config.load()
-        task_names = (task for task in config.tasks.keys() if task and task[0] != "_")
+        task_names = (task for task in config.task_names if task and task[0] != "_")
         print(" ".join(task_names))
     except Exception:  # pylint: disable=broad-except
         # this happens if there's no pyproject.toml present
